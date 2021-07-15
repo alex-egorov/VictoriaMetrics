@@ -81,6 +81,9 @@ func (aw *apiWatcher) mustStart() {
 func (aw *apiWatcher) mustStop() {
 	aw.gw.unsubscribeAPIWatcher(aw)
 	aw.swosByURLWatcherLock.Lock()
+	for _, swosByKey := range aw.swosByURLWatcher {
+		aw.swosCount.Add(-len(swosByKey))
+	}
 	aw.swosByURLWatcher = make(map[*urlWatcher]map[string][]interface{})
 	aw.swosByURLWatcherLock.Unlock()
 }
@@ -100,11 +103,10 @@ func (aw *apiWatcher) setScrapeWorks(uw *urlWatcher, key string, labels []map[st
 		swosByKey = make(map[string][]interface{})
 		aw.swosByURLWatcher[uw] = swosByKey
 	}
+	aw.swosCount.Add(len(swos) - len(swosByKey[key]))
 	if len(swos) > 0 {
-		aw.swosCount.Add(len(swos) - len(swosByKey[key]))
 		swosByKey[key] = swos
 	} else {
-		aw.swosCount.Add(-len(swosByKey[key]))
 		delete(swosByKey, key)
 	}
 	aw.swosByURLWatcherLock.Unlock()
@@ -412,20 +414,11 @@ func (uw *urlWatcher) unsubscribeAPIWatcherLocked(aw *apiWatcher) {
 	}
 }
 
-func (uw *urlWatcher) setResourceVersion(resourceVersion string) {
-	uw.gw.mu.Lock()
-	uw.resourceVersion = resourceVersion
-	uw.gw.mu.Unlock()
-}
-
 // reloadObjects reloads objects to the latest state and returns resourceVersion for the latest state.
 func (uw *urlWatcher) reloadObjects() string {
-	uw.gw.mu.Lock()
-	resourceVersion := uw.resourceVersion
-	uw.gw.mu.Unlock()
-	if resourceVersion != "" {
+	if uw.resourceVersion != "" {
 		// Fast path - there is no need in reloading the objects.
-		return resourceVersion
+		return uw.resourceVersion
 	}
 
 	requestURL := uw.apiURL
@@ -450,29 +443,29 @@ func (uw *urlWatcher) reloadObjects() string {
 	uw.gw.mu.Lock()
 	var updated, removed, added int
 	for key := range uw.objectsByKey {
-		if o, ok := objectsByKey[key]; ok {
-			uw.objectsByKey[key] = o
+		if _, ok := objectsByKey[key]; ok {
 			updated++
 		} else {
-			delete(uw.objectsByKey, key)
 			removed++
 		}
 	}
-	for key, o := range objectsByKey {
+	for key := range objectsByKey {
 		if _, ok := uw.objectsByKey[key]; !ok {
-			uw.objectsByKey[key] = o
 			added++
 		}
 	}
+	uw.objectsByKey = objectsByKey
+	uw.reloadScrapeWorksForAPIWatchersLocked(uw.aws)
+	uw.gw.mu.Unlock()
+
 	uw.objectsUpdated.Add(updated)
 	uw.objectsRemoved.Add(removed)
 	uw.objectsAdded.Add(added)
 	uw.objectsCount.Add(added - removed)
-	uw.reloadScrapeWorksForAPIWatchersLocked(uw.aws)
 	uw.resourceVersion = metadata.ResourceVersion
-	uw.gw.mu.Unlock()
 
-	logger.Infof("reloaded %d objects from %q", len(objectsByKey), requestURL)
+	logger.Infof("reloaded %d objects from %q; updated=%d, removed=%d, added=%d, resourceVersion=%q",
+		len(objectsByKey), requestURL, updated, removed, added, uw.resourceVersion)
 	return uw.resourceVersion
 }
 
@@ -540,7 +533,7 @@ func (uw *urlWatcher) watchForUpdates() {
 				// There is no need for sleep on 410 error. See https://kubernetes.io/docs/reference/using-api/api-concepts/#410-gone-responses
 				backoffDelay = time.Second
 				uw.staleResourceVersions.Inc()
-				uw.setResourceVersion("")
+				uw.resourceVersion = ""
 			} else {
 				body, _ := ioutil.ReadAll(resp.Body)
 				_ = resp.Body.Close()
@@ -555,6 +548,7 @@ func (uw *urlWatcher) watchForUpdates() {
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				logger.Errorf("error when reading WatchEvent stream from %q: %s", requestURL, err)
+				uw.resourceVersion = ""
 			}
 			backoffSleep()
 			continue
@@ -574,14 +568,16 @@ func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
 		case "ADDED", "MODIFIED":
 			o, err := uw.parseObject(we.Object)
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot parse %s object: %w", we.Type, err)
 			}
 			key := o.key()
 			uw.gw.mu.Lock()
 			if _, ok := uw.objectsByKey[key]; !ok {
+				// if we.Type == "MODIFIED" is expected condition after recovering from the bookmarked resourceVersion.
 				uw.objectsCount.Inc()
 				uw.objectsAdded.Inc()
 			} else {
+				// if we.Type == "ADDED" is expected condition after recovering from the bookmarked resourceVersion.
 				uw.objectsUpdated.Inc()
 			}
 			uw.objectsByKey[key] = o
@@ -595,7 +591,7 @@ func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
 		case "DELETED":
 			o, err := uw.parseObject(we.Object)
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot parse %s object: %w", we.Type, err)
 			}
 			key := o.key()
 			uw.gw.mu.Lock()
@@ -614,7 +610,7 @@ func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
 			if err != nil {
 				return fmt.Errorf("cannot parse bookmark from %q: %w", we.Object, err)
 			}
-			uw.setResourceVersion(bm.Metadata.ResourceVersion)
+			uw.resourceVersion = bm.Metadata.ResourceVersion
 		case "ERROR":
 			em, err := parseError(we.Object)
 			if err != nil {
@@ -623,7 +619,7 @@ func (uw *urlWatcher) readObjectUpdateStream(r io.Reader) error {
 			if em.Code == 410 {
 				// See https://kubernetes.io/docs/reference/using-api/api-concepts/#410-gone-responses
 				uw.staleResourceVersions.Inc()
-				uw.setResourceVersion("")
+				uw.resourceVersion = ""
 				return nil
 			}
 			return fmt.Errorf("unexpected error message: %q", we.Object)
